@@ -1,0 +1,297 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include <vector>
+
+// ====== WiFi Credentials ======
+const char* ssid = "metaverse";
+const char* password = "InterneT88";
+
+// ====== Django API Endpoints ======
+const char* loginUrl = "https://dwella-backend.onrender.com/api/token/";
+const char* billsUrl = "https://dwella-backend.onrender.com/api/bills/";
+
+// ====== Admin Login Credentials ======
+const char* adminUsername = "alsonadmin1";
+const char* adminPassword = "alsonadmin1";
+
+// ====== SIM800L Serial ======
+HardwareSerial sim800l(1);
+String accessToken = "";
+
+// ====== Group Struct ======
+struct UserBills {
+  String phone;
+  String first_name;
+  String last_name;
+  String upcoming;
+  String overdue;
+  std::vector<int> ids;
+};
+
+// ====== Read SIM800L ======
+String readResponse(unsigned long timeout = 5000) {
+  String response = "";
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    while (sim800l.available()) {
+      response += (char)sim800l.read();
+    }
+  }
+  return response;
+}
+
+// ====== Wait for GSM ======
+bool waitForNetwork() {
+  Serial.println("📡 Checking SIM800L...");
+  sim800l.println("AT");
+  delay(1000);
+
+  if (readResponse(2000).indexOf("OK") == -1) {
+    Serial.println("❌ SIM800L not responding!");
+    return false;
+  }
+
+  for (int i = 0; i < 10; i++) {
+    sim800l.println("AT+CREG?");
+    delay(1000);
+    String creg = readResponse(1000);
+    if (creg.indexOf(",1") != -1 || creg.indexOf(",5") != -1) {
+      Serial.println("✅ GSM Network Connected!");
+      return true;
+    }
+    Serial.println("⏳ Waiting for GSM signal...");
+    delay(2000);
+  }
+  return false;
+}
+
+// ====== Send SMS ======
+bool sendSMS(const String& number, const String& message) {
+  Serial.println("📨 Sending SMS to: " + number);
+  sim800l.println("AT+CMGF=1");
+  delay(500);
+  sim800l.print("AT+CMGS=\"");
+  sim800l.print(number);
+  sim800l.println("\"");
+  delay(500);
+  sim800l.print(message);
+  sim800l.write(26);
+
+  String resp = readResponse(20000);
+  bool ok = (resp.indexOf("OK") != -1 || resp.indexOf("+CMGS:") != -1);
+  if (ok) Serial.println("✅ SMS sent successfully!");
+  else Serial.println("❌ Failed to send SMS!");
+
+  return ok;
+}
+
+// ====== Login ======
+bool loginAndGetToken() {
+  HTTPClient http;
+  http.begin(loginUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<256> body;
+  body["username"] = adminUsername;
+  body["password"] = adminPassword;
+
+  String out;
+  serializeJson(body, out);
+
+  Serial.println("🔐 Logging in...");
+  int code = http.POST(out);
+  Serial.printf("Login HTTP code: %d\n", code);
+
+  if (code == 200) {
+    StaticJsonDocument<512> resp;
+    deserializeJson(resp, http.getString());
+    accessToken = resp["access"].as<String>();
+    http.end();
+    Serial.println("✅ Token acquired.");
+    return true;
+  }
+
+  Serial.println("❌ Login failed!");
+  Serial.println(http.getString());
+  http.end();
+  return false;
+}
+
+// ====== Update sms_sent ======
+bool updateSMSSent(int billId) {
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    HTTPClient http;
+    String url = String(billsUrl) + String(billId) + "/";
+    http.begin(url);
+    http.addHeader("Authorization", "Bearer " + accessToken);
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<128> doc;
+    doc["sms_sent"] = true;
+    String body;
+    serializeJson(doc, body);
+
+    int code = http.PATCH(body);
+    Serial.printf("📡 Updating bill %d => sms_sent=true (HTTP %d)\n", billId, code);
+
+    if (code == 200 || code == 202) {
+      Serial.println("✅ Bill updated successfully!");
+      http.end();
+      return true;
+    } else {
+      delay(2000);
+    }
+    http.end();
+  }
+  return false;
+}
+
+// ====== Fetch Bills and Send ======
+void fetchAndSendSMS() {
+  if (accessToken.isEmpty() && !loginAndGetToken()) return;
+
+  HTTPClient http;
+  http.begin(billsUrl);
+  http.addHeader("Authorization", "Bearer " + accessToken);
+  int code = http.GET();
+
+  Serial.printf("🌐 Fetching bills... (HTTP %d)\n", code);
+
+  if (code != 200) {
+    if (code == 401) {
+      Serial.println("🔄 Token expired — re-login...");
+      http.end();
+      if (loginAndGetToken()) fetchAndSendSMS();
+    } else {
+      Serial.println("❌ Failed to fetch bills!");
+      Serial.println(http.getString());
+      http.end();
+    }
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<32768> doc;
+  if (deserializeJson(doc, payload)) {
+    Serial.println("❌ JSON parse error.");
+    return;
+  }
+
+  JsonArray results = doc.is<JsonArray>() ? doc.as<JsonArray>() : doc["results"].as<JsonArray>();
+  std::vector<UserBills> users;
+
+  for (JsonObject bill : results) {
+    if (bill["sms_sent"].as<bool>()) continue;
+
+    String dueStatus = bill["due_status"].as<String>();
+    if (!(dueStatus == "upcoming" || dueStatus == "overdue" || dueStatus == "due_today"))
+      continue;
+
+    JsonObject user = bill["user"];
+    String phone = user["phone_number"].as<String>();
+
+    phone.trim();
+    if (phone.startsWith("0"))
+      phone = "+63" + phone.substring(1);
+
+    int idx = -1;
+    for (size_t i = 0; i < users.size(); ++i)
+      if (users[i].phone == phone) { idx = i; break; }
+
+    if (idx == -1) {
+      UserBills ub;
+      ub.phone = phone;
+      ub.first_name = user["first_name"].as<String>();
+      ub.last_name = user["last_name"].as<String>();
+      users.push_back(ub);
+      idx = users.size() - 1;
+    }
+
+    String due_date = bill["due_date"].as<const char*>();
+    String unit_name = bill["unit"]["unit_name"].as<const char*>();
+    String building = bill["unit"]["building"].as<const char*>();   // ⭐ ADDED
+    String amount = bill["amount_due"].as<const char*>();
+
+    // ⭐ UPDATED BLOCK — building added
+    String block =
+      "Building: " + building + "\n" +    // ⭐ ADDED
+      "Unit: " + unit_name + "\n" +
+      "Due date: " + due_date + "\n" +
+      "Amount Due: " + amount + "\n\n";
+
+    if (dueStatus == "upcoming" || dueStatus == "due_today")
+      users[idx].upcoming += block;
+    else
+      users[idx].overdue += block;
+
+    users[idx].ids.push_back(bill["id"].as<int>());
+  }
+
+  for (auto &u : users) {
+    String msg = "Hello " + u.first_name + " " + u.last_name + "\n\n";
+
+    if (u.upcoming.length())
+      msg += "Upcoming Payments:\n" + u.upcoming;
+
+    if (u.overdue.length())
+      msg += "Overdue Payments:\n" + u.overdue;
+
+    Serial.println("========================");
+    Serial.println("Prepared SMS for: " + u.phone);
+
+    if (sendSMS(u.phone, msg)) {
+      delay(2000);
+      for (int id : u.ids)
+        updateSMSSent(id);
+    } else {
+      Serial.println("⚠️ SMS send failed for " + u.phone + " — skipping update.");
+    }
+  }
+
+  Serial.println("✅ All done.");
+}
+
+// ====== Setup ======
+void setup() {
+  Serial.begin(115200);
+  sim800l.begin(9600, SERIAL_8N1, 16, 17);
+
+  Serial.println("🔌 Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi connected!");
+    Serial.print("📶 IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n⚠️ WiFi not connected.");
+  }
+
+  if (!waitForNetwork()) Serial.println("⚠️ GSM network issue.");
+
+  if (loginAndGetToken()) fetchAndSendSMS();
+}
+
+// ====== Auto-run every 60 seconds ======
+void loop() {
+  static unsigned long lastRun = 0;
+  unsigned long now = millis();
+
+  if (now - lastRun >= 60000) {  // 60 sec
+    lastRun = now;
+    Serial.println("\n🔄 Checking for new bills...");
+    fetchAndSendSMS();
+  }
+
+  delay(100);
+}
